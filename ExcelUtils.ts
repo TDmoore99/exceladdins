@@ -1,55 +1,91 @@
-import { Excel } from "@microsoft/office-js";
+import * as Excel from "exceljs";
+
+type FieldConfig = {
+  [key: string]: { range_name: string; initial_cells?: string };
+};
+
+let undoStack: any[] = [];
+
+export const fetchFieldConfig = async (): Promise<FieldConfig> => {
+  return Excel.run(async (context) => {
+    const table = context.workbook.tables.getItemOrNullObject("AIR_MODEL");
+    table.load("name");
+    await context.sync();
+
+    if (table.isNullObject) return {};
+
+    const rows = table.rows.load("items");
+    await context.sync();
+
+    const config: FieldConfig = {};
+    rows.items.forEach((row) => {
+      const key = row.values[0][0];
+      const rangeName = row.values[0][1];
+      const initialCells = row.values[0][2];
+      config[key] = { range_name: rangeName, initial_cells: initialCells };
+    });
+
+    return config;
+  });
+};
 
 export const checkForEmptyCells = async (range: Excel.Range, context: Excel.RequestContext): Promise<boolean> => {
   range.load("values");
   await context.sync();
-  return range.values.some((row) => row.some((cell) => cell === null || cell === "" || cell === undefined));
-};
 
-export const deleteNamedRangeIfExists = async (context: Excel.RequestContext, rangeName: string) => {
-  try {
-    const existingName = context.workbook.names.getItemOrNullObject(rangeName);
-    await context.sync();
-    if (!existingName.isNullObject) {
-      existingName.delete();
-      await context.sync();
+  for (let row of range.values) {
+    for (let cell of row) {
+      if (cell === "" || cell === null) return true;
     }
-  } catch (error) {
-    console.warn(`Error deleting named range "${rangeName}":`, error);
   }
+  return false;
 };
 
-export const addNamedRange = async (context: Excel.RequestContext, rangeName: string, range: Excel.Range) => {
-  context.workbook.names.add(rangeName, range);
+export const addNamedRange = async (context: Excel.RequestContext, name: string, range: Excel.Range) => {
+  context.workbook.names.add(name, range);
   await context.sync();
 };
 
-export const updateMyRangeRow = async (fieldKey: string, rangeName: string, address: string) => {
+export const deleteNamedRangeIfExists = async (context: Excel.RequestContext, name: string) => {
+  const existing = context.workbook.names.getItemOrNullObject(name);
+  existing.load("name");
+  await context.sync();
+
+  if (!existing.isNullObject) {
+    existing.delete();
+    await context.sync();
+  }
+};
+
+export const updateAirModelRow = async (key: string, rangeName: string, address: string) => {
   await Excel.run(async (context) => {
-    const table = context.workbook.tables.getItem("MY_RANGE");
-    const dataRange = table.getDataBodyRange();
-    dataRange.load("values");
+    const table = context.workbook.tables.getItem("AIR_MODEL");
+    const dataBodyRange = table.getDataBodyRange().load("values");
     await context.sync();
 
-    const tableData = dataRange.values;
-    const matchIndex = tableData.findIndex((row) => row[0] === fieldKey);
-
-    if (matchIndex !== -1) {
-      const targetCell = dataRange.getCell(matchIndex, 2);
-      targetCell.values = [[address]];
-    } else {
-      table.rows.add(null, [[fieldKey, rangeName, address]]);
+    const rows = dataBodyRange.values;
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i][0] === key) {
+        table.rows.getItemAt(i).values = [[key, rangeName, address]];
+        await context.sync();
+        break;
+      }
     }
-
-    await context.sync();
   });
 };
 
-export const sanitizeFormulaInput = (input: string): string => {
-  return input.replace(/[^\w\d\=\+\-\*\/\(\)\:\,\.\!\$]/g, "");
+export const parseFormula = (formula: string): string => {
+  if (!formula.startsWith("=")) return `=${formula}`;
+  return formula;
 };
 
-export const parseFormulaFunction = (formula: string): string | null => {
-  const match = formula.match(/^=\s*([A-Z]+)\s*\(/i);
-  return match ? match[1].toUpperCase() : null;
+export const pushUndoState = (state: any) => {
+  undoStack.push(JSON.parse(JSON.stringify(state)));
+};
+
+export const popUndoState = (): any | null => {
+  if (undoStack.length > 0) {
+    return undoStack.pop();
+  }
+  return null;
 };
