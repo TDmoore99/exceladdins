@@ -1,251 +1,173 @@
 import React, { useEffect, useState } from "react";
+import * as Excel from "exceljs";
 import {
+  fetchFieldConfig,
   checkForEmptyCells,
-  deleteNamedRangeIfExists,
   addNamedRange,
-  updatemyRangeRow,
-  sanitizeFormulaInput,
-  parseFormulaFunction
+  deleteNamedRangeIfExists,
+  updateAirModelRow,
+  parseFormula,
+  pushUndoState,
+  popUndoState,
 } from "../services/excelUtils";
-import { Excel } from "@microsoft/office-js";
 
 type FieldConfig = {
-  [key: string]: {
-    range_name: string;
-  };
+  [key: string]: { range_name: string; initial_cells?: string };
 };
 
-type FormulaInputs = {
-  [key: string]: string;
+const FormulaInputRow: React.FC<{
+  fieldKey: string;
+  value: string;
+  onChange: (newValue: string) => void;
+  onPickRange: () => void;
+  activeField: string | null;
+}> = ({ fieldKey, value, onChange, onPickRange, activeField }) => {
+  const handleFunctionInsert = (func: string) => {
+    if (func) {
+      onChange(`${func}()`);
+    }
+  };
+
+  return (
+    <div className="flex items-center space-x-2 mb-2">
+      <label className="w-32">{fieldKey}</label>
+      <input
+        type="text"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={`Formula for ${fieldKey}`}
+        className="border p-1 flex-1"
+        disabled={activeField === fieldKey}
+      />
+      <button onClick={onPickRange} className="border px-2 py-1 bg-blue-100">
+        Pick Range
+      </button>
+      <select
+        title="Select a formula function"
+        onChange={(e) => handleFunctionInsert(e.target.value)}
+        className="border p-1"
+      >
+        <option value="">Function...</option>
+        <option value="SUM">SUM</option>
+        <option value="AVERAGE">AVERAGE</option>
+        <option value="MAX">MAX</option>
+        <option value="MIN">MIN</option>
+      </select>
+    </div>
+  );
 };
 
 const FinMappingPane: React.FC = () => {
+  const [formulas, setFormulas] = useState<{ [key: string]: string }>({});
   const [fieldConfig, setFieldConfig] = useState<FieldConfig>({});
-  const [formulas, setFormulas] = useState<FormulaInputs>({});
-  const [undoStack, setUndoStack] = useState<FormulaInputs[]>([]);
-  const [redoStack, setRedoStack] = useState<FormulaInputs[]>([]);
-  const [activeField, setActiveField] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [activeField, setActiveField] = useState<string | null>(null);
 
   useEffect(() => {
-    loadFieldsFromApi();
-    registerExcelEvents();
-  }, []);
+    const loadConfig = async () => {
+      const config = await fetchFieldConfig();
+      setFieldConfig(config);
 
-  const loadFieldsFromApi = async () => {
-    const mockApiResponse: FieldConfig = {
-      StartDate: { range_name: "StartDateRange" },
-      EndDate: { range_name: "EndDateRange" },
-      Amount: { range_name: "AmountRange" }
+      const initialFormulas: { [key: string]: string } = {};
+      for (const key in config) {
+        if (config[key].initial_cells) {
+          initialFormulas[key] = config[key].initial_cells;
+        }
+      }
+      setFormulas(initialFormulas);
     };
 
-    setFieldConfig(mockApiResponse);
-    await prefillFrommyRangeTable(mockApiResponse);
-  };
+    loadConfig();
 
-  const prefillFrommyRangeTable = async (config: FieldConfig) => {
-    await Excel.run(async (context) => {
-      try {
-        const table = context.workbook.tables.getItem("MY_RANGE");
-        const dataRange = table.getDataBodyRange();
-        dataRange.load("values");
-        await context.sync();
-
-        const tableData = dataRange.values;
-        const newFormulas: FormulaInputs = {};
-
-        Object.keys(config).forEach((key) => {
-          const matchRow = tableData.find((row) => row[0] === key);
-          if (matchRow && matchRow[2]) {
-            newFormulas[key] = `=${matchRow[2]}`;
-          }
-        });
-
-        setFormulas((prev) => ({
-          ...prev,
-          ...newFormulas
-        }));
-      } catch (e) {
-        setError("Error reading MY_RANGE table.");
-      }
-    });
-  };
-
-  const pushUndoState = () => {
-    setUndoStack((prev) => [...prev, { ...formulas }]);
-    setRedoStack([]);
-  };
-
-  const undo = () => {
-    if (undoStack.length > 0) {
-      const last = undoStack.pop()!;
-      setRedoStack((prev) => [...prev, { ...formulas }]);
-      setFormulas(last);
-    }
-  };
-
-  const redo = () => {
-    if (redoStack.length > 0) {
-      const next = redoStack.pop()!;
-      setUndoStack((prev) => [...prev, { ...formulas }]);
-      setFormulas(next);
-    }
-  };
-
-  const registerExcelEvents = () => {
     Excel.run(async (context) => {
       const sheet = context.workbook.worksheets.getActiveWorksheet();
-
       sheet.onSelectionChanged.add(async () => {
-        if (activeField) {
-          const range = context.workbook.getSelectedRange();
-          range.load(["address", "values"]);
-          await context.sync();
+        if (!activeField) return;
 
-          const hasEmptyCells = await checkForEmptyCells(range, context);
-          if (hasEmptyCells) {
-            setError(`Error: The selected range for "${activeField}" contains empty cells.`);
-            return;
-          }
+        const range = context.workbook.getSelectedRange();
+        range.load(["address", "values"]);
+        await context.sync();
 
-          setError(null);
-          const rangeName = fieldConfig[activeField]?.range_name;
-          if (rangeName) {
-            await deleteNamedRangeIfExists(context, rangeName);
-            await addNamedRange(context, rangeName, range);
-
-            pushUndoState();
-            setFormulas((prev) => ({
-              ...prev,
-              [activeField]: `=${rangeName}`
-            }));
-
-            await updatemyRangeRow(activeField, rangeName, range.address);
-          }
+        const hasEmpty = await checkForEmptyCells(range, context);
+        if (hasEmpty) {
+          setError(`Error: Selected range for "${activeField}" contains empty cells.`);
+          setActiveField(null);
+          return;
         }
+
+        setError(null);
+        const rangeName = fieldConfig[activeField]?.range_name;
+        if (rangeName) {
+          await deleteNamedRangeIfExists(context, rangeName);
+          await addNamedRange(context, rangeName, range);
+
+          pushUndoState(formulas);
+          setFormulas((prev) => ({
+            ...prev,
+            [activeField]: `=${rangeName}`,
+          }));
+
+          await updateAirModelRow(activeField, rangeName, range.address);
+        }
+        setActiveField(null);
       });
+    });
+  }, [activeField, fieldConfig]);
 
-      await context.sync();
-    }).catch((e) => setError("Error registering Excel events."));
-  };
-
-  const handlePickRange = (fieldKey: string) => {
-    setActiveField(fieldKey);
-  };
-
-  const handleFormulaChange = (fieldKey: string, value: string) => {
-    pushUndoState();
+  const handleInputChange = (key: string, value: string) => {
     setFormulas((prev) => ({
       ...prev,
-      [fieldKey]: sanitizeFormulaInput(value)
+      [key]: value,
     }));
   };
 
-  const handleSubmit = async () => {
+  const handlePickRange = (key: string) => {
+    setActiveField(key);
+  };
+
+  const handleUndo = () => {
+    const previousState = popUndoState();
+    if (previousState) setFormulas(previousState);
+  };
+
+  const handleSave = async () => {
     try {
       await Excel.run(async (context) => {
-        const table = context.workbook.tables.getItem("MY_RANGE");
-        const dataRange = table.getDataBodyRange();
-        dataRange.load("values");
-        await context.sync();
-
-        const tableData = dataRange.values;
-
-        for (const key of Object.keys(formulas)) {
-          const formulaText = formulas[key].replace(/^=/, "");
-          const matchIndex = tableData.findIndex((row) => row[0] === key);
-
-          if (matchIndex !== -1) {
-            const targetCell = dataRange.getCell(matchIndex, 2);
-            targetCell.values = [[formulaText]];
-          } else {
-            table.rows.add(null, [[key, fieldConfig[key]?.range_name || "", formulaText]]);
-          }
+        for (const key in formulas) {
+          const formula = parseFormula(formulas[key]);
+          console.log(`Saving for ${key}: ${formula}`);
         }
-
-        await context.sync();
       });
-    } catch (e) {
-      setError("Submit error updating Excel.");
+    } catch (err) {
+      setError(`Error saving formulas: ${err}`);
     }
   };
 
   return (
     <div className="p-4">
-      <h2 className="text-xl font-bold mb-2">Financial Field Mapping</h2>
-      {error && <div className="text-red-600 mb-2">{error}</div>}
-
-      <div className="flex gap-2 mb-4">
-        <button onClick={undo} disabled={undoStack.length === 0} className="bg-gray-300 px-2 py-1 rounded">
-          Undo
-        </button>
-        <button onClick={redo} disabled={redoStack.length === 0} className="bg-gray-300 px-2 py-1 rounded">
-          Redo
-        </button>
-      </div>
+      <h2 className="text-lg mb-4">Financial Mapping</h2>
 
       {Object.keys(fieldConfig).map((key) => (
         <FormulaInputRow
           key={key}
           fieldKey={key}
           value={formulas[key] || ""}
+          onChange={(val) => handleInputChange(key, val)}
           onPickRange={() => handlePickRange(key)}
-          onChange={(val) => handleFormulaChange(key, val)}
-          detectedFunction={parseFormulaFunction(formulas[key] || "")}
+          activeField={activeField}
         />
       ))}
 
-      <button onClick={handleSubmit} className="mt-4 px-4 py-2 bg-blue-500 text-white rounded">
-        Submit
-      </button>
-    </div>
-  );
-};
+      {error && <div className="text-red-600">{error}</div>}
 
-type FormulaInputRowProps = {
-  fieldKey: string;
-  value: string;
-  onPickRange: () => void;
-  onChange: (value: string) => void;
-  detectedFunction: string | null;
-};
-
-const FormulaInputRow: React.FC<FormulaInputRowProps> = ({
-  fieldKey,
-  value,
-  onPickRange,
-  onChange,
-  detectedFunction
-}) => {
-  const handleFunctionInsert = (funcName: string) => {
-    if (funcName) {
-      onChange(`=${funcName}()`);
-    }
-  };
-
-  return (
-    <div className="mb-4">
-      <label className="font-semibold">{fieldKey}</label>
-      <div className="flex items-center gap-2 mt-1">
-        <input
-          type="text"
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          placeholder={`Formula for ${fieldKey}`}
-          className="border p-1 flex-1"
-        />
-        <button onClick={onPickRange} className="bg-green-500 text-white px-2 py-1 rounded">
-          Pick Range
+      <div className="flex space-x-2 mt-4">
+        <button onClick={handleUndo} className="border px-2 py-1 bg-yellow-100">
+          Undo
         </button>
-        <select onChange={(e) => handleFunctionInsert(e.target.value)} className="border p-1">
-          <option value="">Function...</option>
-          <option value="SUM">SUM</option>
-          <option value="AVERAGE">AVERAGE</option>
-          <option value="MAX">MAX</option>
-          <option value="MIN">MIN</option>
-        </select>
+        <button onClick={handleSave} className="border px-2 py-1 bg-green-200">
+          Save
+        </button>
       </div>
-      {detectedFunction && <div className="text-sm text-gray-500">Detected: {detectedFunction}</div>}
     </div>
   );
 };
